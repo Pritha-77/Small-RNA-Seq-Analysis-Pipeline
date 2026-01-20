@@ -1,0 +1,242 @@
+#----------------------------------
+#----------------------------------
+#Small RNA-Seq Analysis
+#----------------------------------
+#----------------------------------
+# Small RNAs are fascinating molecules that challenge the traditional “DNA to RNA to protein” dogma of molecular biology.
+# Despite being just 20-30 nucleotides in length – barely a fraction of a typical messenger RNA – these molecules orchestrate
+# complex biological processes with remarkable precision. Think of them as the conductors of the cellular orchestra, coordinating
+# when and how genes are expressed.
+# Small RNAs: Tiny molecules, big roles in gene regulation
+# - MicroRNAs (miRNAs): master regulators
+#     • Direct mRNA degradation (like a paper shredder)
+#     • Translational repression (blocks protein production)
+#     • Influence development, immunity, disease responses
+#
+# - Small interfering RNAs (siRNAs): defense mechanism via RNAi
+#     • Target viral RNA and maintain genomic stability
+#     • Nobel Prize 2006 for RNA interference discovery
+#
+# - PIWI-interacting RNAs (piRNAs): genome guardians in germline
+#     • Keep transposable elements in check
+#     • Prevent genome instability
+#
+# - Emerging small RNA classes:
+#     • tRNA-derived small RNAs (tsRNAs): stress response
+#     • snRNA/snoRNA fragments: potential regulatory roles
+
+#--------------------------------
+#conda environment
+#--------------------------------
+
+conda create -n rnaseq_env python=3.9
+conda activate rnaseq_env
+conda install -n base -c conda-forge mamba
+
+mamba install -c conda-forge -c bioconda \
+    fastqc \
+    fastq-screen \
+    multiqc \
+    trim-galore \
+    cutadapt \
+    star \
+    bowtie2 \
+    samtools \
+    subread \
+    sra-tools 
+mamba install -c bioconda seqkit
+
+# Install Bowtie - our specialized tool for small RNA alignment
+# While Bowtie is an older tool, it excels at handling short sequences
+mamba install -c bioconda adapterremoval
+mamba install -c conda-forge -c bioconda \
+    bowtie \
+    miRTrace
+
+mirtrace --help
+#--------------------------------
+#Preparing Your Reference Files
+#--------------------------------
+ 
+# Download and extract the human genome from Ensembl
+wget https://ftp.ensembl.org/pub/release-113/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+gunzip Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+ 
+# Get the gene annotations
+wget https://ftp.ensembl.org/pub/release-113/gtf/homo_sapiens/Homo_sapiens.GRCh38.113.gtf.gz
+gunzip Homo_sapiens.GRCh38.113.gtf.gz
+ 
+# Create a small RNA-specific annotation file
+# This filters for just the RNA types we're interested in
+grep -P 'gene_biotype "(miRNA|snRNA|snoRNA|rRNA|tRNA|piRNA)"' \
+    Homo_sapiens.GRCh38.113.gtf > small_RNA.gtf
+ 
+# Build the Bowtie index - think of this as creating a specialized 
+# reference book for quick lookups
+bowtie-build Homo_sapiens.GRCh38.dna.primary_assembly.fa bowtie_index_hg38
+
+#-------------------------------------------------
+#Step 1: Quality Control and Adapter Trimming
+#------------------------------------------------
+
+#Option 1#
+AdapterRemoval \
+  --file1 SRR10905119.fastq.gz \
+  --output1 SRR10905119.trimmed.fastq.gz \
+  --trimns \
+  --trimqualities \
+  --minlength 18
+
+mv SRR10905119.trimmed.fastq.gz SRR10905119.trimmed.fastq
+fastqc SRR10905119.trimmed.fastq -o fastqc_post_adapterremoval -t 4
+gzip SRR10905119.trimmed.fastq
+
+mirtrace qc --species hsa SRR10905119.trimmed.fastq.gz
+
+
+#Option 2#
+
+# Trim adapters and filter for quality
+# Note: This adapter sequence is from the NEBNext® Multiplex kit
+# Adjust if you're using a different kit
+
+trim_galore --fastqc \
+    --quality 20 \
+    --phred33 \
+    --length 18 \
+    --stringency 3 \
+    --three_prime_clip_R1 1 \
+    --cores 8 \
+    --adapter AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC \
+    SRR10905119.fastq.gz \
+	-o ~/trim_gallore/
+ 
+
+# Filter for appropriate read lengths
+# Small RNAs are short, so we want to keep only reads ≤35 bases
+zcat SRR10905119.trimmed.fastq.gz | \
+    awk 'BEGIN {FS = "\n"}
+    {
+        header = $0
+        getline seq
+        getline plus
+        getline qual
+        if (length(seq) <= 35) {
+            print header "\n" seq "\n" plus "\n" qual
+        }
+}' | gzip > SRR10905119.trimmed.maxlen35.fastq.gz
+
+#OR#
+
+seqkit seq -M 35 SRR10905119.trimmed.fastq.gz | gzip > SRR10905119.trimmed.maxlen35.fastq.gz
+
+
+#-----------------------------------------------------------------------
+#Step 2: Genome Alignment – Finding Where Your Small RNAs Come From
+#----------------------------------------------------------------------
+
+# Align reads to the genome using Bowtie
+# Parameters explained:
+# -v 1: Allow 1 mismatch
+# -m 1: Report only unique alignments
+# -m 10
+# --best --strata: Get the best possible alignments
+bowtie -v 1 -m 1 --best --strata --norc -l 18 \
+    -x bowtie_index_hg38 \
+    -p 20 \
+    -q SRR10905119.trimmed.maxlen35.fastq.gz \
+    -S SRR10905119.trimmed.maxlen35.sam
+
+# --norc discards reverse-strand alignments; can also be omitted from the script as miRNAs originate from both strands.
+
+
+# Convert, sort, and index your aligned reads
+samtools view -bS SRR10905119.trimmed.maxlen35.sam \
+    > SRR10905119.trimmed.maxlen35.bam
+ 
+samtools sort SRR10905119.trimmed.maxlen35.bam \
+    -o SRR10905119.trimmed.maxlen35.sorted.bam
+ 
+samtools index SRR10905119.trimmed.maxlen35.sorted.bam
+ 
+# Generate alignment statistics to check how well things worked
+samtools flagstat SRR10905119.trimmed.maxlen35.sorted.bam \
+    > SRR10905119.trimmed.maxlen35.sorted.bam.flagstat
+
+#-----------------------------------------------------------------------
+Step 3: Quantification – Counting Your Small RNAs
+#----------------------------------------------------------------------- 
+ 
+# Use featureCounts to quantify small RNAs
+# -T 20: Use 20 threads for faster processing
+# -s 1: Consider strandedness
+
+featureCounts -T 20 \
+    -t gene \     #-t miRNA \
+    -g gene_id \
+    -s 1 \
+    -a small_RNA.gtf \
+    -o SRR10905119_featureCounts_gene.txt \
+    SRR10905119.trimmed.maxlen35.sorted.bam
+#-s 1 assumes stranded library.
+#If unsure, use: -s 0
+
+#-----------------------------------------------------------------------
+#Step 4: Data Integration and Analysis in R
+#-----------------------------------------------------------------------
+setwd("C:/miRNA-trial.2")
+# Load your essential R packages
+library(data.table)
+library(edgeR)
+library(stringr)
+ 
+# Find all your count files
+count_file_path <- "C:/miRNA-trial.2"
+file_names <- list.files(count_file_path, 
+                        pattern = "_featureCounts_gene\\.txt$", 
+                        recursive = T, 
+                        full.names = T)
+ 
+# Create a DGElist object - this organizes your count data
+dgls <- readDGE(file_names, columns = c(1, 7), skip = 1)
+counts_raw <- as.data.frame(dgls$counts)
+ 
+# Clean up sample names for clarity
+sample_name <- gsub("_featureCounts_gene\\.txt$", "", basename(colnames(counts_raw)))
+
+colnames(counts_raw) <- sample_name
+ 
+# Process gene annotations to make your results interpretable
+gtf <- fread("small_RNA.gtf")
+gtf_gene <- gtf[V3 == "gene"]
+ 
+# Create a mapping between gene IDs and names
+id_name_df <- data.table(
+    gene_id = gsub("gene_id| |\"", "", 
+                   sapply(strsplit(gtf_gene[[9]], ";"), 
+                          \(x) {x[str_detect(x, "gene_id")]})),
+    gene_name = gsub("gene_name| |\"", "", 
+                     sapply(strsplit(gtf_gene[[9]], ";"), 
+                            \(x) {x[str_detect(x, "gene_name")]}))
+)
+ 
+ 
+#OR#
+library(rtracklayer)
+gtf <- import("small_RNA.gtf")
+id_name_df <- unique(as.data.frame(gtf)[, c("gene_id","gene_name")])
+
+# Clean up and combine your data
+id_name_df[id_name_df == "character(0)"] <- NA
+rownames(id_name_df) <- id_name_df[[1]]
+id_name_df <- id_name_df[rownames(counts_raw), ]
+counts_raw <- cbind(id_name_df, counts_raw)
+ 
+# Save your processed count table
+fwrite(counts_raw, "counts_raw.tsv", sep = "\t")
+
+#----------------------------------------------------------------------- 
+#Step 5: Differential Expression Analysis
+#-----------------------------------------------------------------------
+
+#The differential expression analysis of small RNA sequencing data builds upon the fundamental principles we covered in our previous pipeline.

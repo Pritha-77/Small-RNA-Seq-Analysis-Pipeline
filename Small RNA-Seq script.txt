@@ -172,7 +172,7 @@ Step 3: Quantification – Counting Your Small RNAs
 # -s 1: Consider strandedness
 
 featureCounts -T 20 \
-    -t gene \     #-t miRNA \
+    -t gene \    
     -g gene_id \
     -s 1 \
     -a small_RNA.gtf \
@@ -240,3 +240,4 @@ fwrite(counts_raw, "counts_raw.tsv", sep = "\t")
 #-----------------------------------------------------------------------
 
 #The differential expression analysis of small RNA sequencing data builds upon the fundamental principles we covered in our previous pipeline.
+
